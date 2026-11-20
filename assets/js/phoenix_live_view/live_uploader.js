@@ -1,5 +1,6 @@
 import {
   PHX_DONE_REFS,
+  PHX_ERROR_REFS,
   PHX_PREFLIGHTED_REFS,
   PHX_UPLOAD_REF,
 } from "./constants";
@@ -10,6 +11,19 @@ import DOM from "./dom";
 import UploadEntry from "./upload_entry";
 
 let liveUploaderFileRef = 0;
+
+/**
+ * Why a form submit was dropped because of its uploads:
+ *
+ * - `entry-errors`: upload inputs carry entries with errors
+ * - `preflight-rejected`: the server rejected the entries in the preflight
+ * - `preflight-failed`: the preflight push failed (error reply or timeout)
+ * - `upload-failed`: an upload failed after the preflight
+ * - `awaiting-preflight`: entries still need a preflight after the uploads
+ * - `entries-removed`: the entries a scheduled submit waited for are gone
+ *
+ * @typedef {"entry-errors" | "preflight-rejected" | "preflight-failed" | "upload-failed" | "awaiting-preflight" | "entries-removed"} BlockedSubmitReason
+ */
 
 export default class LiveUploader {
   static genFileRef(file) {
@@ -41,6 +55,12 @@ export default class LiveUploader {
       }
     });
     return active > 0;
+  }
+
+  static inputsWithUploadErrors(formEl) {
+    return DOM.findUploadInputs(formEl).filter(
+      (input) => (input.getAttribute(PHX_ERROR_REFS) || "") !== "",
+    );
   }
 
   static serializeUploads(inputEl) {
@@ -102,8 +122,7 @@ export default class LiveUploader {
   }
 
   static activeFileInputs(formEl) {
-    const fileInputs = DOM.findUploadInputs(formEl);
-    return Array.from(fileInputs).filter(
+    return DOM.findUploadInputs(formEl).filter(
       (el) => el.files && this.activeFiles(el).length > 0,
     );
   }
@@ -115,8 +134,7 @@ export default class LiveUploader {
   }
 
   static inputsAwaitingPreflight(formEl) {
-    const fileInputs = DOM.findUploadInputs(formEl);
-    return Array.from(fileInputs).filter(
+    return DOM.findUploadInputs(formEl).filter(
       (input) => this.filesAwaitingPreflight(input).length > 0,
     );
   }
@@ -153,6 +171,12 @@ export default class LiveUploader {
 
   entries() {
     return this._entries;
+  }
+
+  cancel() {
+    this._entries
+      .filter((entry) => !entry.isDone())
+      .forEach((entry) => entry.cancel());
   }
 
   initAdapterUpload(resp, onError, liveSocket) {

@@ -21,7 +21,7 @@ defmodule Phoenix.LiveViewTest.Support.UploadLive do
         <% end %>
         relative path:{entry.client_relative_path}
       <% end %>
-      <.live_file_input upload={@uploads.avatar} />
+      <.live_file_input upload={@uploads.avatar} disabled={assigns[:upload_disabled]} />
       <button type="submit">save</button>
     </form>
     """
@@ -53,6 +53,15 @@ defmodule Phoenix.LiveViewTest.Support.UploadLive do
 
   def handle_event("validate", _params, socket) do
     {:noreply, socket}
+  end
+
+  def handle_event("save", _params, socket) do
+    consumed =
+      Phoenix.LiveView.consume_uploaded_entries(socket, :avatar, fn _meta, entry ->
+        {:ok, entry.client_name}
+      end)
+
+    {:noreply, update(socket, :consumed, &(&1 ++ consumed))}
   end
 
   ## test helpers
@@ -168,6 +177,12 @@ end
 defmodule Phoenix.LiveViewTest.Support.UploadLiveWithComponent do
   use Phoenix.LiveView
 
+  def render(%{replaced: true} = assigns) do
+    ~H"""
+    <div>replaced</div>
+    """
+  end
+
   def render(assigns) do
     ~H"""
     <div>
@@ -190,6 +205,10 @@ defmodule Phoenix.LiveViewTest.Support.UploadLiveWithComponent do
 
   def handle_call({:uploads, count}, _from, socket) do
     {:reply, :ok, assign(socket, :uploads_count, count)}
+  end
+
+  def handle_call({:replace_root, replaced?}, _from, socket) do
+    {:reply, :ok, assign(socket, :replaced, replaced?)}
   end
 
   def handle_call({:run, func}, from, socket) do

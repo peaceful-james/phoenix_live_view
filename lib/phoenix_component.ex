@@ -1198,7 +1198,7 @@ defmodule Phoenix.Component do
 
   The output is a list. The following error may be returned:
 
-  * `:too_many_files` - The number of selected files exceeds the `:max_entries` constraint
+  * `:too_many_files` - The number of files exceeds the `:max_entries` constraint
 
   ## Examples
 
@@ -1223,8 +1223,10 @@ defmodule Phoenix.Component do
 
   * `:too_large` - The entry exceeds the `:max_file_size` constraint
   * `:not_accepted` - The entry does not match the `:accept` MIME types
-  * `:external_client_failure` - When external upload fails
+  * `:external_client_failure` - When an external client uploader reports a failure
   * `{:writer_failure, reason}` - When the custom writer fails with `reason`
+  * `{:external_metadata_failure, error_meta}` - When external upload metadata
+    generation fails with `{:error, error_meta, socket}`
   * `reason` - When the custom validator fails with `reason`
 
   ## Examples
@@ -1233,6 +1235,9 @@ defmodule Phoenix.Component do
   defp upload_error_to_string(:too_large), do: "The file is too large"
   defp upload_error_to_string(:not_accepted), do: "You have selected an unacceptable file type"
   defp upload_error_to_string(:external_client_failure), do: "Something went terribly wrong"
+  defp upload_error_to_string({:external_metadata_failure, %{reason: :presign_failed}}),
+    do: "Could not prepare upload"
+
   defp upload_error_to_string(:custom_validator_error), do: "Custom validation error"
   ```
 
@@ -3351,10 +3356,13 @@ defmodule Phoenix.Component do
   def live_file_input(%{upload: upload} = assigns) do
     assigns = assign_new(assigns, :accept, fn -> upload.accept != :any && upload.accept end)
 
+    # autocomplete="off" prevents Firefox from restoring an enabled input before the hook mounts.
+    # https://bugzilla.mozilla.org/show_bug.cgi?id=654072#c71
     ~H"""
     <input
       id={@upload.ref}
       type="file"
+      autocomplete="off"
       name={@upload.name}
       accept={@accept}
       data-phx-hook="Phoenix.LiveFileUpload"
@@ -3364,10 +3372,19 @@ defmodule Phoenix.Component do
       data-phx-preflighted-refs={
         join_refs(for(entry <- @upload.entries, entry.preflighted?, do: entry.ref))
       }
+      data-phx-error-refs={
+        @upload.errors != [] && join_refs(for {ref, _reason} <- @upload.errors, uniq: true, do: ref)
+      }
       data-phx-auto-upload={@upload.auto_upload?}
-      {if @upload.max_entries > 1, do: Map.put(@rest, :multiple, true), else: @rest}
+      {live_file_input_attrs(@rest, @upload.max_entries)}
     />
     """
+  end
+
+  defp live_file_input_attrs(rest, max_entries) do
+    rest = if max_entries > 1, do: Map.put(rest, :multiple, true), else: rest
+    rest = if rest[:disabled], do: Map.put(rest, :"data-phx-user-disabled", true), else: rest
+    Map.put(rest, :disabled, true)
   end
 
   defp join_refs(entries), do: Enum.join(entries, ",")

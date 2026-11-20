@@ -121,8 +121,8 @@ test("popstate", async ({ page }) => {
   await expect(page).toHaveURL(/\/navigation\/a\?/);
   expect(networkEvents).toEqual([]);
 
-  await page.getByRole("link", { name: "LiveView B" }).click(),
-    await syncLV(page);
+  await page.getByRole("link", { name: "LiveView B" }).click();
+  await syncLV(page);
   await expect(page).toHaveURL("/navigation/b");
   expect(networkEvents).toEqual([]);
 
@@ -146,6 +146,378 @@ test("popstate", async ({ page }) => {
   expect(networkEvents).toEqual([]);
 });
 
+test("can prevent live link navigation with before navigate", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+
+  await page.evaluate(() => {
+    window.beforeNavigateEvents = [];
+    window.navigateEvents = [];
+    window.preventNavigation = true;
+    window.addEventListener("phx:before-navigate", (event) => {
+      window.beforeNavigateEvents.push(event.detail);
+      if (window.preventNavigation) {
+        event.preventDefault();
+      }
+    });
+    window.addEventListener("phx:navigate", (event) => {
+      window.navigateEvents.push(event.detail);
+    });
+  });
+
+  networkEvents = [];
+  webSocketEvents = [];
+
+  await page.getByRole("link", { name: "LiveView B" }).click();
+
+  await expect(page).toHaveURL("/navigation/a");
+  expect(networkEvents).toEqual([]);
+  expect(webSocketEvents).toEqual([]);
+  expect(await page.evaluate(() => window.beforeNavigateEvents)).toEqual([
+    {
+      href: "http://localhost:4004/navigation/b",
+      patch: false,
+      pop: false,
+      direction: "forward",
+    },
+  ]);
+  expect(await page.evaluate(() => window.navigateEvents)).toEqual([]);
+
+  await page.evaluate(() => {
+    window.preventNavigation = false;
+  });
+  await page.getByRole("link", { name: "LiveView B" }).click();
+  await syncLV(page);
+
+  await expect(page).toHaveURL("/navigation/b");
+  expect(networkEvents).toEqual([]);
+});
+
+test("can prevent popstate navigation with before navigate", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+
+  await page.getByRole("link", { name: "LiveView B" }).click();
+  await syncLV(page);
+  await expect(page).toHaveURL("/navigation/b");
+
+  await page.evaluate(() => {
+    window.beforeNavigateEvents = [];
+    window.navigateEvents = [];
+    window.preventNavigation = true;
+    window.addEventListener("phx:before-navigate", (event) => {
+      window.beforeNavigateEvents.push(event.detail);
+      if (window.preventNavigation) {
+        event.preventDefault();
+      }
+    });
+    window.addEventListener("phx:navigate", (event) => {
+      window.navigateEvents.push(event.detail);
+    });
+  });
+
+  networkEvents = [];
+  webSocketEvents = [];
+
+  await page.goBack();
+
+  await expect(page).toHaveURL("/navigation/b");
+  expect(networkEvents).toEqual([]);
+  expect(webSocketEvents).toEqual([]);
+  expect(await page.evaluate(() => window.beforeNavigateEvents)).toEqual([
+    {
+      href: "http://localhost:4004/navigation/a",
+      patch: false,
+      pop: true,
+      direction: "backward",
+    },
+  ]);
+  expect(await page.evaluate(() => window.navigateEvents)).toEqual([]);
+
+  await page.evaluate(() => {
+    window.preventNavigation = false;
+  });
+  await page.goBack();
+  await syncLV(page);
+
+  await expect(page).toHaveURL("/navigation/a");
+  expect(networkEvents).toEqual([]);
+});
+
+test("can prevent popstate navigation across a fragment entry with before navigate", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+
+  await page.getByRole("link", { name: "LiveView B" }).click();
+  await syncLV(page);
+  await page.getByRole("link", { name: "Go to 42." }).click();
+  await expect(page).toHaveURL("/navigation/b#items-item-42");
+  await page.getByRole("link", { name: "Item 1", exact: true }).click();
+  await syncLV(page);
+  await expect(page).toHaveURL("/navigation/b/item-1");
+
+  await page.evaluate(() => history.go(-3));
+  await expect(page).toHaveURL("/navigation/a");
+  await syncLV(page);
+
+  await page.evaluate(() => {
+    window.beforeNavigateEvents = [];
+    window.preventNavigation = true;
+    window.addEventListener("phx:before-navigate", (event) => {
+      window.beforeNavigateEvents.push(event.detail);
+      if (window.preventNavigation) {
+        event.preventDefault();
+      }
+    });
+  });
+
+  await page.evaluate(() => history.go(3));
+
+  await expect
+    .poll(() => page.evaluate(() => window.beforeNavigateEvents))
+    .not.toEqual([]);
+  await expect(page).toHaveURL("/navigation/a");
+  expect(await page.evaluate(() => window.beforeNavigateEvents)).toEqual([
+    {
+      href: "http://localhost:4004/navigation/b/item-1",
+      patch: true,
+      pop: true,
+      direction: "forward",
+    },
+  ]);
+
+  // the revert returned to the original entry
+  await page.evaluate(() => {
+    window.preventNavigation = false;
+  });
+  await page.evaluate(() => history.go(3));
+  await expect(page).toHaveURL("/navigation/b/item-1");
+  await syncLV(page);
+
+  await page.evaluate(() => {
+    window.beforeNavigateEvents = [];
+    window.preventNavigation = true;
+  });
+
+  await page.evaluate(() => history.go(-3));
+
+  await expect
+    .poll(() => page.evaluate(() => window.beforeNavigateEvents))
+    .not.toEqual([]);
+  await expect(page).toHaveURL("/navigation/b/item-1");
+  expect(await page.evaluate(() => window.beforeNavigateEvents)).toEqual([
+    {
+      href: "http://localhost:4004/navigation/a",
+      patch: false,
+      pop: true,
+      direction: "backward",
+    },
+  ]);
+});
+
+test("can prevent popstate navigation to an entry pushed by other scripts with before navigate", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+
+  await page.getByRole("link", { name: "LiveView B" }).click();
+  await syncLV(page);
+  await page.evaluate(() =>
+    history.pushState(null, "", "/navigation/b?foreign=1"),
+  );
+  await page.getByRole("link", { name: "Item 1", exact: true }).click();
+  await syncLV(page);
+  await expect(page).toHaveURL("/navigation/b/item-1");
+
+  await page.evaluate(() => history.go(-3));
+  await expect(page).toHaveURL("/navigation/a");
+  await syncLV(page);
+
+  await page.evaluate(() => {
+    window.beforeNavigateEvents = [];
+    window.preventNavigation = true;
+    window.addEventListener("phx:before-navigate", (event) => {
+      window.beforeNavigateEvents.push(event.detail);
+      if (window.preventNavigation) {
+        event.preventDefault();
+      }
+    });
+  });
+
+  await page.evaluate(() => history.go(2));
+
+  await expect
+    .poll(() => page.evaluate(() => window.beforeNavigateEvents))
+    .not.toEqual([]);
+  await expect(page).toHaveURL("/navigation/a");
+  expect(await page.evaluate(() => window.beforeNavigateEvents)).toEqual([
+    {
+      href: "http://localhost:4004/navigation/b?foreign=1",
+      patch: false,
+      pop: true,
+      direction: "forward",
+    },
+  ]);
+
+  // the revert returned to the original entry
+  await page.evaluate(() => {
+    window.preventNavigation = false;
+  });
+  await page.evaluate(() => history.go(3));
+  await expect(page).toHaveURL("/navigation/b/item-1");
+});
+
+test("can prevent popstate navigation across an iframe entry with before navigate", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+
+  await page.getByRole("link", { name: "LiveView B" }).click();
+  await syncLV(page);
+  // the iframe lives outside the LiveView, so it survives live navigation
+  await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        const iframe = document.createElement("iframe");
+        iframe.srcdoc = "<p>iframe</p>";
+        iframe.onload = () => {
+          iframe.contentWindow.history.pushState(null, "");
+          resolve();
+        };
+        document.body.appendChild(iframe);
+      }),
+  );
+  await page.getByRole("link", { name: "Item 1", exact: true }).click();
+  await syncLV(page);
+  await expect(page).toHaveURL("/navigation/b/item-1");
+
+  await page.evaluate(() => history.go(-3));
+  await expect(page).toHaveURL("/navigation/a");
+  await syncLV(page);
+
+  await page.evaluate(() => {
+    window.beforeNavigateEvents = [];
+    window.preventNavigation = true;
+    window.addEventListener("phx:before-navigate", (event) => {
+      window.beforeNavigateEvents.push(event.detail);
+      if (window.preventNavigation) {
+        event.preventDefault();
+      }
+    });
+  });
+
+  await page.evaluate(() => history.go(3));
+
+  await expect
+    .poll(() => page.evaluate(() => window.beforeNavigateEvents))
+    .not.toEqual([]);
+  await expect(page).toHaveURL("/navigation/a");
+  expect(await page.evaluate(() => window.beforeNavigateEvents)).toEqual([
+    {
+      href: "http://localhost:4004/navigation/b/item-1",
+      patch: true,
+      pop: true,
+      direction: "forward",
+    },
+  ]);
+
+  // the revert returned to the original entry
+  await page.evaluate(() => {
+    window.preventNavigation = false;
+  });
+  await page.evaluate(() => history.go(3));
+  await expect(page).toHaveURL("/navigation/b/item-1");
+});
+
+test("before navigate does not prevent server-side navigation", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+
+  await page.evaluate(() => {
+    window.beforeNavigateEvents = [];
+    window.addEventListener("phx:before-navigate", (event) => {
+      window.beforeNavigateEvents.push(event.detail);
+      event.preventDefault();
+    });
+  });
+
+  await page.getByRole("button", { name: "Server Navigate" }).click();
+  await syncLV(page);
+
+  await expect(page).toHaveURL("/navigation/b");
+  expect(await page.evaluate(() => window.beforeNavigateEvents)).toEqual([]);
+});
+
+test("JS.patch and JS.navigate resolve relative hrefs", async ({ page }) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+
+  networkEvents = [];
+  webSocketEvents = [];
+
+  await page.getByRole("button", { name: "JS patch (relative)" }).click();
+  await syncLV(page);
+
+  await expect(page).toHaveURL(/\/navigation\/a\?param=-?\d+$/);
+  const url = page.url();
+  const param = new URL(url).searchParams.get("param");
+  await expect(page.getByText(`Current param: ${param}`)).toBeVisible();
+  expect(networkEvents).toEqual([]);
+  expect(webSocketEvents).toEqual([
+    {
+      type: "sent",
+      payload: expect.stringContaining(`"live_patch",{"url":"${url}"}`),
+    },
+    { type: "received", payload: expect.stringContaining("phx_reply") },
+  ]);
+
+  // a rejoin sends the full URL as well
+  webSocketEvents = [];
+  await page.evaluate(
+    () => new Promise((resolve) => window.liveSocket.disconnect(resolve)),
+  );
+  await page.evaluate(() => window.liveSocket.connect());
+  await syncLV(page);
+
+  await expect(page.getByText(`Current param: ${param}`)).toBeVisible();
+  expect(webSocketEvents).toEqual(
+    expect.arrayContaining([
+      { type: "sent", payload: expect.stringContaining(`"url":"${url}"`) },
+    ]),
+  );
+
+  networkEvents = [];
+  webSocketEvents = [];
+
+  await page.getByRole("button", { name: "JS navigate (relative)" }).click();
+  await syncLV(page);
+
+  await expect(page).toHaveURL("/navigation/b");
+  expect(networkEvents.filter((e) => e.url.includes("/navigation/"))).toEqual(
+    [],
+  );
+  expect(webSocketEvents).toEqual(
+    expect.arrayContaining([
+      {
+        type: "sent",
+        payload: expect.stringContaining(
+          '"redirect":"http://localhost:4004/navigation/b"',
+        ),
+      },
+    ]),
+  );
+});
+
 test("patch with replace replaces history", async ({ page }) => {
   await page.goto("/navigation/a");
   await syncLV(page);
@@ -160,9 +532,184 @@ test("patch with replace replaces history", async ({ page }) => {
   expect(page.url()).not.toEqual(url);
 });
 
+test("navigate creates its history entry when the link is clicked", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+  const length = await page.evaluate(() => window.history.length);
+
+  await page.getByRole("link", { name: "Slow", exact: true }).click();
+  // the entry exists while the slow LiveView is still mounting
+  await expect(page).toHaveURL("/navigation/slow?sleep=1000");
+  await expect(
+    page.getByRole("heading", { name: "This is page A" }),
+  ).toBeVisible();
+  expect(await page.evaluate(() => window.history.length)).toEqual(length + 1);
+
+  await expect(
+    page.getByRole("heading", { name: "This is the slow page" }),
+  ).toBeVisible();
+  await syncLV(page);
+  expect(await page.evaluate(() => window.history.length)).toEqual(length + 1);
+  expect(await page.evaluate(() => window.history.state)).toEqual(
+    expect.objectContaining({ type: "redirect" }),
+  );
+
+  await page.goBack();
+  await syncLV(page);
+  await expect(page).toHaveURL("/navigation/a");
+  await expect(
+    page.getByRole("heading", { name: "This is page A" }),
+  ).toBeVisible();
+});
+
+test("going back while navigate is pending cancels the navigation", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+
+  await page.getByRole("link", { name: "Slow", exact: true }).click();
+  await expect(page).toHaveURL("/navigation/slow?sleep=1000");
+  await page.goBack();
+
+  await expect(page).toHaveURL("/navigation/a");
+  await expect(
+    page.getByRole("heading", { name: "This is page A" }),
+  ).toBeVisible();
+  await syncLV(page);
+  // the slow mount has finished by now, but must not be rendered
+  await page.waitForTimeout(1500);
+  await expect(page).toHaveURL("/navigation/a");
+  await expect(
+    page.getByRole("heading", { name: "This is page A" }),
+  ).toBeVisible();
+});
+
+test("navigate that supersedes a pending navigate reuses its history entry", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+  const length = await page.evaluate(() => window.history.length);
+
+  await page.getByRole("link", { name: "Slow", exact: true }).click();
+  await expect(page).toHaveURL("/navigation/slow?sleep=1000");
+  await page.getByRole("link", { name: "LiveView B" }).click();
+  await syncLV(page);
+
+  await expect(page).toHaveURL("/navigation/b");
+  await expect(
+    page.getByRole("heading", { name: "This is page B" }),
+  ).toBeVisible();
+  expect(await page.evaluate(() => window.history.length)).toEqual(length + 1);
+
+  await page.goBack();
+  await syncLV(page);
+  await expect(page).toHaveURL("/navigation/a");
+});
+
+test("live redirect on mount replaces the navigate history entry", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+  const length = await page.evaluate(() => window.history.length);
+
+  await page.getByRole("link", { name: "Slow (live redirect)" }).click();
+  await syncLV(page);
+
+  await expect(page).toHaveURL("/navigation/b");
+  await expect(
+    page.getByRole("heading", { name: "This is page B" }),
+  ).toBeVisible();
+  expect(await page.evaluate(() => window.history.length)).toEqual(length + 1);
+
+  await page.goBack();
+  await syncLV(page);
+  await expect(page).toHaveURL("/navigation/a");
+});
+
+test("redirect on mount replaces the navigate history entry", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+  const length = await page.evaluate(() => window.history.length);
+
+  await page.getByRole("link", { name: "Slow (redirect)" }).click();
+
+  await expect(page).toHaveURL("/navigation/dead");
+  await expect(page.getByRole("heading", { name: "Dead view" })).toBeVisible();
+  expect(await page.evaluate(() => window.history.length)).toEqual(length + 1);
+
+  await page.goBack();
+  await syncLV(page);
+  await expect(page).toHaveURL("/navigation/a");
+});
+
+for (const name of ["Patch to fragment", "Navigate to fragment"]) {
+  test(`going back while "${name}" is pending cancels the navigation`, async ({
+    page,
+  }) => {
+    await page.goto("/navigation/a");
+    await syncLV(page);
+    await page.evaluate(() => window.liveSocket.enableLatencySim(500));
+
+    await page.getByRole("link", { name }).click();
+    await expect(page).toHaveURL("/navigation/a#fragment");
+    await page.goBack();
+    await expect(page).toHaveURL("/navigation/a");
+
+    // the reply has arrived by now, but must not restore the fragment
+    await page.waitForTimeout(1500);
+    await expect(page).toHaveURL("/navigation/a");
+    await expect(
+      page.getByRole("heading", { name: "This is page A" }),
+    ).toBeVisible();
+  });
+}
+
+test("canceling back keeps a pending fragment-only navigation", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+  await page.evaluate(() => {
+    window.canceledPops = 0;
+    window.addEventListener("phx:before-navigate", (event) => {
+      if (event.detail.pop) {
+        window.canceledPops++;
+        event.preventDefault();
+      }
+    });
+    window.liveSocket.enableLatencySim(500);
+  });
+
+  await page.getByRole("link", { name: "Patch to fragment" }).click();
+  await expect(page).toHaveURL("/navigation/a#fragment");
+  await page.goBack();
+
+  await page.waitForTimeout(1500);
+  await expect(page).toHaveURL("/navigation/a#fragment");
+  expect(await page.evaluate(() => window.canceledPops)).toBe(1);
+});
+
+test("live links to another origin fall back to http navigation", async ({
+  page,
+}) => {
+  await page.goto("/navigation/a");
+  await syncLV(page);
+
+  await page.getByRole("link", { name: "Other origin" }).click();
+
+  await expect(page).toHaveURL("http://127.0.0.1:4004/navigation/dead");
+  await expect(page.getByRole("heading", { name: "Dead view" })).toBeVisible();
+});
+
 test("falls back to http navigation when navigating between live sessions", async ({
   page,
-  browserName,
 }) => {
   await page.goto("/navigation/a");
   await syncLV(page);
@@ -180,18 +727,15 @@ test("falls back to http navigation when navigating between live sessions", asyn
     ]),
   );
   expect(webSocketEvents).toEqual(
-    expect.arrayContaining(
-      [
-        { type: "sent", payload: expect.stringContaining("phx_leave") },
-        { type: "sent", payload: expect.stringContaining("phx_join") },
-        {
-          type: "received",
-          payload: expect.stringMatching(/error.*unauthorized/),
-        },
-      ].concat(browserName === "webkit" ? [] : [{ type: "close" }]),
-    ),
+    expect.arrayContaining([
+      { type: "sent", payload: expect.stringContaining("phx_leave") },
+      { type: "sent", payload: expect.stringContaining("phx_join") },
+      {
+        type: "received",
+        payload: expect.stringMatching(/error.*unauthorized/),
+      },
+    ]),
   );
-  // ^ webkit doesn't always seem to emit websocket close events
 });
 
 test("restores scroll position after navigation", async ({ page }) => {
@@ -299,13 +843,18 @@ test("scrolls hash el into view after live navigation (issue #3452)", async ({
 
   await page.getByRole("link", { name: "Navigate to 42" }).click();
   await expect(page).toHaveURL("/navigation/b#items-item-42");
+  // the URL is updated on click, before the new LiveView is rendered
+  await expect(
+    page.getByRole("heading", { name: "This is page B" }),
+  ).toBeVisible();
+  const offset =
+    (await page.locator("#items-item-42").evaluate((el) => el.offsetTop)) - 200;
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollTop))
+    .toBeGreaterThanOrEqual(offset - 500);
   const scrollTop = await page.evaluate(
     () => document.documentElement.scrollTop,
   );
-  const offset =
-    (await page.locator("#items-item-42").evaluate((el) => el.offsetTop)) - 200;
-  expect(scrollTop).not.toBe(0);
-  expect(scrollTop).toBeGreaterThanOrEqual(offset - 500);
   expect(scrollTop).toBeLessThanOrEqual(offset + 500);
 });
 
@@ -328,6 +877,8 @@ test("restores scroll position when navigating from dead view", async ({
 
   await page.getByRole("link", { name: "Dead" }).click();
   await page.waitForURL("/navigation/dead");
+  // live navigation updates the URL before falling back to a page load
+  await expect(page.getByRole("heading", { name: "Dead view" })).toBeVisible();
 
   await page.goBack();
   await syncLV(page);

@@ -40,9 +40,16 @@ import {
   closure,
   debug,
   maybe,
-  logError,
   eventContainsFiles,
+  resolveURL,
 } from "./utils";
+import {
+  dispatchDiagnostic,
+  LiveViewDiagnosticContext,
+  logError,
+  type LiveViewDiagnosticLevel,
+  type LiveViewDiagnosticMetadata,
+} from "./diagnostics";
 
 import Browser from "./browser";
 import DOM from "./dom";
@@ -52,6 +59,9 @@ import View from "./view";
 import JS from "./js";
 import jsCommands, { EncodedJS, LiveSocketJSCommands } from "./js_commands";
 import { HooksOptions } from "./view_hook";
+import { RenderingBuffer, ReportingBuffer } from "./rendered/buffer";
+
+const BUFFERS = Object.freeze({ RenderingBuffer, ReportingBuffer });
 
 /**
  * Returns true if the given element was touched by a user.
@@ -81,8 +91,7 @@ export interface LiveSocketOptions {
    *
    */
   params?:
-    | ((el: HTMLElement) => { [key: string]: any })
-    | { [key: string]: any };
+    ((el: HTMLElement) => { [key: string]: any }) | { [key: string]: any };
   /**
    * The optional prefix to use for all phx DOM annotations.
    *
@@ -182,6 +191,14 @@ export interface LiveSocketOptions {
    * Defaults to `false`.
    */
   blockPhxChangeWhileComposing?: boolean;
+  /**
+   * Whether `phx-remove` commands on descendants of the outgoing main LiveView
+   * are executed during live navigation. When set to `false`, only a
+   * `phx-remove` command on the LiveView's own container is executed.
+   *
+   * Defaults to `true`.
+   */
+  cascadePhxRemoveOnNavigation?: boolean;
   /** DOM callbacks. */
   dom?: {
     /**
@@ -213,6 +230,8 @@ export interface LiveSocketOptions {
      *   }
      * })
      * ```
+     *
+     * Note: start callbacks must be called in the order they are received.
      *
      * It is strongly advised to call start as quickly as possible.
      */
@@ -257,6 +276,8 @@ export default class LiveSocket {
   private roots: Record<string, View>;
   private href: string;
   private pendingLink: string | null;
+  private historyReservation: { position: number; referer: string } | null;
+  private redirectAfterPopState: (() => void) | null;
   private currentLocation: Location;
   private hooks: HooksOptions;
   /** @internal */
@@ -272,6 +293,7 @@ export default class LiveSocket {
   private boundTopLevelEvents: boolean;
   private boundEventNames: Set<string>;
   private blockPhxChangeWhileComposing: boolean;
+  private cascadePhxRemoveOnNavigation: boolean;
   private serverCloseRef: string | null;
   /** @internal */
   domCallbacks: {
@@ -298,6 +320,15 @@ export default class LiveSocket {
   uploaders: any;
   /** @internal */
   disconnectedTimeout: number;
+  /** @internal */
+  RenderingBuffer: typeof RenderingBuffer;
+  /**
+   * The buffer base classes, for tooling holding only a LiveSocket handle:
+   * they are not otherwise reachable from a page it did not bundle.
+   *
+   * @internal
+   */
+  readonly buffers = BUFFERS;
 
   /**
    * Creates a new LiveSocket instance.
@@ -346,9 +377,12 @@ export default class LiveSocket {
     this.roots = {};
     this.href = window.location.href;
     this.pendingLink = null;
+    this.historyReservation = null;
+    this.redirectAfterPopState = null;
     this.currentLocation = clone(window.location);
     this.hooks = opts.hooks || {};
     this.uploaders = opts.uploaders || {};
+    this.RenderingBuffer = RenderingBuffer;
     this.loaderTimeout = opts.loaderTimeout || LOADER_TIMEOUT;
     this.disconnectedTimeout = opts.disconnectedTimeout || DISCONNECTED_TIMEOUT;
     /**
@@ -365,6 +399,9 @@ export default class LiveSocket {
     this.boundEventNames = new Set();
     this.blockPhxChangeWhileComposing =
       opts.blockPhxChangeWhileComposing || false;
+    // TODO: Default to false in LiveView 2.0.
+    this.cascadePhxRemoveOnNavigation =
+      opts.cascadePhxRemoveOnNavigation ?? true;
     this.serverCloseRef = null;
     this.domCallbacks = Object.assign(
       {
@@ -405,6 +442,33 @@ export default class LiveSocket {
    */
   isProfileEnabled(): boolean {
     return this.sessionStorage.getItem(PHX_LV_PROFILE) === "true";
+  }
+
+  /**
+   * Installs a rendered buffer: what the renderer writes rendered HTML through.
+   *
+   * A buffer can observe or annotate the output — for example to mark which
+   * HEEx function components re-rendered, for a debugging overlay. See
+   * {@link RenderingBuffer} for the protocol a buffer implements.
+   *
+   * It applies to views that are already mounted as well as to views that join
+   * later, and nothing is re-rendered to install it: it sees each part of the
+   * page the next time a patch renders that part, so a buffer that annotates
+   * the output leaves whatever is already in the DOM untouched until then.
+   *
+   *     const previous = liveSocket.attachDebugBuffer(MyBuffer)
+   *
+   * @param bufferClass - a class extending {@link RenderingBuffer}.
+   * @returns The class installed until now, to restore it with.
+   *
+   * @internal
+   */
+  attachDebugBuffer(
+    bufferClass: typeof RenderingBuffer,
+  ): typeof RenderingBuffer {
+    const current = this.RenderingBuffer;
+    this.RenderingBuffer = bufferClass;
+    return current;
   }
 
   /**
@@ -495,7 +559,11 @@ export default class LiveSocket {
    */
   connect(): void {
     // enable debug by default if on localhost and not explicitly disabled
-    if (window.location.hostname === "localhost" && !this.isDebugDisabled()) {
+    const host = window.location.hostname.toLowerCase();
+    if (
+      (host === "localhost" || host.endsWith(".localhost")) &&
+      !this.isDebugDisabled()
+    ) {
       this.enableDebug();
     }
     const doConnect = () => {
@@ -576,7 +644,9 @@ export default class LiveSocket {
       return;
     }
     if (this.main && this.isConnected()) {
-      this.log(this.main, "socket", () => ["disconnect for page nav"]);
+      this.log(this.main, "socket", () => ["disconnect for page nav"], {
+        code: "socket.page-navigation-disconnect",
+      });
     }
     this.unloaded = true;
     this.destroyAllViews();
@@ -600,13 +670,42 @@ export default class LiveSocket {
   }
 
   /** @internal */
-  log(view, kind, msgCallback) {
+  log(
+    view,
+    kind,
+    msgCallback,
+    diagnostic?: {
+      code: string;
+      level?: LiveViewDiagnosticLevel;
+      metadata?: () => LiveViewDiagnosticMetadata;
+      context?: LiveViewDiagnosticContext;
+    },
+  ) {
+    const debugEnabled = this.isDebugEnabled();
+    const level = diagnostic?.level ?? "debug";
+    // debug-level diagnostics are only emitted when debugging is enabled,
+    // while other levels are always emitted; console output stays gated on
+    // debugging (or the viewLogger) either way
+    const emitDiagnostic = !!diagnostic && (level !== "debug" || debugEnabled);
+    if (!this.viewLogger && !debugEnabled && !emitDiagnostic) {
+      return;
+    }
+
+    const [message, obj] = msgCallback();
     if (this.viewLogger) {
-      const [msg, obj] = msgCallback();
-      this.viewLogger(view, kind, msg, obj);
-    } else if (this.isDebugEnabled()) {
-      const [msg, obj] = msgCallback();
-      debug(view, kind, msg, obj);
+      this.viewLogger(view, kind, message, obj);
+    } else if (debugEnabled) {
+      debug(view, kind, message, obj);
+    }
+    if (emitDiagnostic && diagnostic) {
+      dispatchDiagnostic({
+        level,
+        code: diagnostic.code,
+        message,
+        viewId: view.id,
+        metadata: diagnostic.metadata?.(),
+        ...(diagnostic.context || { attribution: "unknown" }),
+      });
     }
   }
 
@@ -663,16 +762,31 @@ export default class LiveSocket {
       view.destroy();
       log
         ? log()
-        : this.log(view, "join", () => [
-            `encountered ${tries} consecutive reloads`,
-          ]);
+        : this.log(
+            view,
+            "join",
+            () => [`encountered ${tries} consecutive reloads`],
+            {
+              code: "view.reload-attempts",
+              metadata: () => ({ tries }),
+            },
+          );
       if (tries >= this.maxReloads) {
-        this.log(view, "join", () => [
-          `exceeded ${this.maxReloads} consecutive reloads. Entering failsafe mode`,
-        ]);
+        this.log(
+          view,
+          "join",
+          () => [
+            `exceeded ${this.maxReloads} consecutive reloads. Entering failsafe mode`,
+          ],
+          {
+            code: "view.reload-failsafe",
+            level: "error",
+            metadata: () => ({ tries, maxReloads: this.maxReloads }),
+          },
+        );
       }
       if (this.pendingLink !== null) {
-        window.location.href = this.pendingLink;
+        this.browserRedirect(this.pendingLink);
       } else {
         window.location.reload();
       }
@@ -706,7 +820,15 @@ export default class LiveSocket {
     }
     let callbacks = window[`phx_hook_${name}`];
     if (!callbacks || typeof callbacks !== "function") {
-      logError("a runtime hook must be a function", runtimeHook);
+      logError(
+        "hook.runtime-not-function",
+        "a runtime hook must be a function",
+        {
+          runtimeHook,
+          name,
+        },
+        { attribution: "app" },
+      );
       return;
     }
     const hookDefiniton = callbacks();
@@ -717,8 +839,10 @@ export default class LiveSocket {
       return hookDefiniton;
     }
     logError(
+      "hook.runtime-invalid-return",
       "runtime hook must return an object with hook callbacks or an instance of ViewHook",
-      runtimeHook,
+      { runtimeHook, name },
+      { attribution: "app" },
     );
   }
 
@@ -800,7 +924,26 @@ export default class LiveSocket {
       Browser.setCookie(PHX_RELOAD_STATUS, reloadToken, 60);
     }
     this.unload();
-    Browser.redirect(to, flash);
+    this.browserRedirect(to, flash);
+  }
+
+  /**
+   * @internal
+   * Performs a full page navigation. If the current history entry was reserved
+   * for a live navigation that never completed, we first return to the entry
+   * before it, so that the page load does not leave a second entry behind.
+   * Replacing the reserved entry with a page load does not work, as some
+   * browsers then treat going back to the previous entry as a same-document
+   * navigation within the new page.
+   */
+  browserRedirect(to: string, flash: string | null = null) {
+    if (this.historyReservation) {
+      this.historyReservation = null;
+      this.redirectAfterPopState = () => Browser.redirect(to, flash);
+      history.back();
+    } else {
+      Browser.redirect(to, flash);
+    }
   }
 
   /** @internal */
@@ -813,14 +956,16 @@ export default class LiveSocket {
     if (!this.main) {
       return;
     }
-    const liveReferer = this.currentLocation.href;
+    const liveReferer = this.historyReservation
+      ? this.historyReservation.referer
+      : this.currentLocation.href;
     this.outgoingMainEl = this.outgoingMainEl || this.main!.el;
 
     const stickies = DOM.findPhxSticky(document) || [];
-    const removeEls = DOM.all(
+    const removeEls = this.phxRemoveElementsForNavigation(
       this.outgoingMainEl!,
-      `[${this.binding("remove")}]`,
-    ).filter((el) => !DOM.isChildOfAny(el, stickies));
+      stickies,
+    );
 
     const newMainEl = DOM.cloneNode(this.outgoingMainEl, "");
     const oldMainView = this.main;
@@ -835,8 +980,14 @@ export default class LiveSocket {
     this.main.join((joinCount, onDone) => {
       if (joinCount === 1 && this.commitPendingLink(linkRef)) {
         this.requestDOMUpdate(() => {
-          // remove phx-remove els right before we replace the main element
-          removeEls.forEach((el) => el.remove());
+          // Remove descendant phx-remove elements right before we replace the
+          // main element. The outgoing main itself must remain connected so
+          // replaceWith below can swap in the new main element.
+          removeEls.forEach((el) => {
+            if (!el.isSameNode(this.outgoingMainEl)) {
+              el.remove();
+            }
+          });
           stickies.forEach((el) => newMainEl.appendChild(el));
           this.outgoingMainEl!.replaceWith(newMainEl);
           this.outgoingMainEl = null;
@@ -845,6 +996,20 @@ export default class LiveSocket {
         });
       }
     });
+  }
+
+  private phxRemoveElementsForNavigation(
+    mainEl: Element,
+    stickies = DOM.findPhxSticky(document) || [],
+  ) {
+    const removeSelector = `[${this.binding("remove")}]`;
+    const removeEls = this.cascadePhxRemoveOnNavigation
+      ? [mainEl, ...DOM.all(mainEl, removeSelector)]
+      : [mainEl];
+
+    return removeEls.filter(
+      (el) => el.matches(removeSelector) && !DOM.isChildOfAny(el, stickies),
+    );
   }
 
   /** @internal */
@@ -910,7 +1075,7 @@ export default class LiveSocket {
   }
 
   /** @internal */
-  withinOwners(childEl, callback) {
+  withinOwners(childEl, callback: (view: View, targetCtx: Element) => unknown) {
     this.owner(childEl, (view) => callback(view, childEl));
   }
 
@@ -983,18 +1148,21 @@ export default class LiveSocket {
 
   /** @internal */
   bindTopLevelEvents({ dead }: { dead?: boolean } = {}) {
+    if (this.serverCloseRef === null) {
+      // enter failsafe reload if server has gone away intentionally, such as "disconnect" broadcast
+      this.serverCloseRef = this.socket.onClose((event) => {
+        // failsafe reload if normal closure and we still have a main LV
+        if (event && event.code === 1000 && this.main) {
+          return this.reloadWithJitter(this.main);
+        }
+      });
+    }
+
     if (this.boundTopLevelEvents) {
       return;
     }
 
     this.boundTopLevelEvents = true;
-    // enter failsafe reload if server has gone away intentionally, such as "disconnect" broadcast
-    this.serverCloseRef = this.socket.onClose((event) => {
-      // failsafe reload if normal closure and we still have a main LV
-      if (event && event.code === 1000 && this.main) {
-        return this.reloadWithJitter(this.main);
-      }
-    });
     document.body.addEventListener("click", function () {}); // ensure all click events bubble for mobile Safari
     window.addEventListener(
       "pageshow",
@@ -1048,6 +1216,15 @@ export default class LiveSocket {
       },
     );
     this.on("dragover", (e) => e.preventDefault());
+
+    // Browsers fire dragenter and dragleave when a drag crosses child element boundaries, even
+    // though it is still inside the same drop target. Track those events per drop target so that
+    // entering a child and leaving its sibling balance each other. When the drag leaves the drop
+    // target or the browser window, the final dragleave has no matching dragenter and reaches zero.
+    // This avoids relying on browser-specific pointer coordinates or relatedTarget, which is null
+    // for all dragleave events in older Safari versions.
+    const dropTargetDragDepths = new WeakMap<HTMLElement, number>();
+
     this.on("dragenter", (e) => {
       let target = e.target && DOM.elementFromTarget(e.target);
       if (!target) {
@@ -1060,7 +1237,11 @@ export default class LiveSocket {
       }
 
       if (eventContainsFiles(e)) {
-        this.js().addClass(dropzone, PHX_DROP_TARGET_ACTIVE_CLASS);
+        const dragDepth = (dropTargetDragDepths.get(dropzone) || 0) + 1;
+        dropTargetDragDepths.set(dropzone, dragDepth);
+        if (dragDepth === 1) {
+          this.js().addClass(dropzone, PHX_DROP_TARGET_ACTIVE_CLASS);
+        }
       }
     });
     this.on("dragleave", (e) => {
@@ -1074,15 +1255,13 @@ export default class LiveSocket {
         return;
       }
 
-      // Avoid add/remove jitter in the case that we drag into a new child and that child would
-      // resolve their closest drop target to the current dropzone element
-      const rect = dropzone.getBoundingClientRect();
-      if (
-        e.clientX <= rect.left ||
-        e.clientX >= rect.right ||
-        e.clientY <= rect.top ||
-        e.clientY >= rect.bottom
-      ) {
+      const dragDepth = dropTargetDragDepths.get(dropzone);
+      if (dragDepth === undefined) {
+        return;
+      } else if (dragDepth > 1) {
+        dropTargetDragDepths.set(dropzone, dragDepth - 1);
+      } else {
+        dropTargetDragDepths.delete(dropzone);
         this.js().removeClass(dropzone, PHX_DROP_TARGET_ACTIVE_CLASS);
       }
     });
@@ -1097,6 +1276,7 @@ export default class LiveSocket {
       if (!dropzone || !(dropzone instanceof HTMLElement)) {
         return;
       }
+      dropTargetDragDepths.delete(dropzone);
       this.js().removeClass(dropzone, PHX_DROP_TARGET_ACTIVE_CLASS);
 
       if (!e.dataTransfer) {
@@ -1307,21 +1487,19 @@ export default class LiveSocket {
         // then treat the portal source as the starting point instead.
         startedAt = portalStartedAt;
       }
-      if (
-        !(
-          el.isSameNode(startedAt) ||
-          el.contains(startedAt) ||
-          // When clicking a link with custom method,
-          // phoenix_html triggers a click on a submit button
-          // of a hidden form appended to the body. For such cases
-          // where the clicked target is hidden, we skip click-away.
-          //
-          // Also, when we have a portal, we don't want to check the visibility
-          // of the portal source, as it's a <template> that is always not visible.
-          // Instead, check the visibility of the original click target.
-          !JS.isVisible(clickStartedAt)
-        )
-      ) {
+      if (!(
+        el.isSameNode(startedAt) ||
+        el.contains(startedAt) ||
+        // When clicking a link with custom method,
+        // phoenix_html triggers a click on a submit button
+        // of a hidden form appended to the body. For such cases
+        // where the clicked target is hidden, we skip click-away.
+        //
+        // Also, when we have a portal, we don't want to check the visibility
+        // of the portal source, as it's a <template> that is always not visible.
+        // Instead, check the visibility of the original click target.
+        !JS.isVisible(clickStartedAt)
+      )) {
         this.withinOwners(el, (view) => {
           const phxEvent = el.getAttribute(phxClickAway);
           if (JS.isVisible(el) && JS.isInViewport(el)) {
@@ -1352,18 +1530,64 @@ export default class LiveSocket {
         );
       }, 100);
     });
+    // The Navigation API also tracks entries without a position, such as
+    // fragments. currententrychange fires right before popstate.
+    let traversedFrom: NavigationHistoryEntry | null = null;
+    if (window.navigation) {
+      window.navigation.addEventListener("currententrychange", (event) => {
+        traversedFrom = event.navigationType === "traverse" ? event.from : null;
+      });
+    }
     window.addEventListener(
       "popstate",
       (event) => {
-        if (!this.registerNewLocation(window.location)) {
+        const from = traversedFrom;
+        traversedFrom = null;
+        if (this.redirectAfterPopState) {
+          const redirect = this.redirectAfterPopState;
+          this.redirectAfterPopState = null;
+          return redirect();
+        }
+        // Leaving a reserved entry cancels its pending navigation, even if only
+        // the fragment differs. Returning to it, for example after a canceled
+        // phx:before-navigate, must not start a new navigation.
+        const leftReservation =
+          this.historyReservation &&
+          event.state?.position !== this.historyReservation.position;
+        if (!leftReservation && !this.isNewLocation(window.location)) {
           return;
         }
         const { type, backType, id, scroll, position } = event.state || {};
         const href = window.location.href;
 
-        // Compare positions to determine direction
-        const isForward = position > this.currentHistoryPosition;
+        // Prefer Navigation API indexes over positions to determine direction
+        const isForward = from
+          ? window.navigation.currentEntry!.index > from.index
+          : position > this.currentHistoryPosition;
         const navType = isForward ? type : backType || type;
+        const direction = isForward ? "forward" : "backward";
+        const detail = {
+          href,
+          patch: navType === "patch",
+          pop: true,
+          direction,
+        };
+
+        if (!this.dispatchBeforeNavigate(detail)) {
+          // Because we only register the new location afterwards,
+          // the back / forward popstate event exits early in the isNewLocation check.
+          if (from) {
+            window.navigation.traverseTo(from.key);
+          } else if (isForward) {
+            history.back();
+          } else {
+            history.forward();
+          }
+          return;
+        }
+
+        this.historyReservation = null;
+        this.registerNewLocation(window.location);
 
         // Update current position
         this.currentHistoryPosition = position || 0;
@@ -1372,14 +1596,7 @@ export default class LiveSocket {
           this.currentHistoryPosition.toString(),
         );
 
-        DOM.dispatchEvent(window, "phx:navigate", {
-          detail: {
-            href,
-            patch: navType === "patch",
-            pop: true,
-            direction: isForward ? "forward" : "backward",
-          },
-        });
+        DOM.dispatchEvent(window, "phx:navigate", { detail });
         this.requestDOMUpdate(() => {
           const callback = () => {
             this.maybeScroll(scroll);
@@ -1410,7 +1627,12 @@ export default class LiveSocket {
           PHX_LIVE_LINK,
         ) as HTMLAnchorElement | null;
         const type = target && target.getAttribute(PHX_LIVE_LINK);
-        if (!type || !this.isConnected() || !this.main || DOM.wantsNewTab(e)) {
+        if (
+          !type ||
+          !this.isConnected() ||
+          !this.main ||
+          DOM.wantsNewTab(e, target)
+        ) {
           return;
         }
 
@@ -1426,26 +1648,46 @@ export default class LiveSocket {
             `expected ${PHX_LINK_STATE} to be "replace" or "push", got: ${linkState}`,
           );
         }
+        if (type !== "patch" && type !== "redirect") {
+          throw new Error(
+            `expected ${PHX_LIVE_LINK} to be "patch" or "redirect", got: ${type}`,
+          );
+        }
         e.preventDefault();
         e.stopImmediatePropagation(); // do not bubble click to regular phx-click bindings
         if (this.pendingLink === href) {
           return;
         }
 
-        this.requestDOMUpdate(() => {
-          if (type === "patch") {
-            this.pushHistoryPatch(e, href, linkState, target);
-          } else if (type === "redirect") {
-            this.historyRedirect(e, href, linkState, null, target);
-          } else {
-            throw new Error(
-              `expected ${PHX_LIVE_LINK} to be "patch" or "redirect", got: ${type}`,
-            );
-          }
-          const phxClick = target.getAttribute(this.binding("click"));
+        const detail = {
+          href,
+          patch: type === "patch",
+          pop: false,
+          direction: "forward",
+        };
+        const phxClick = target.getAttribute(this.binding("click"));
+        const execPhxClick = () => {
           if (phxClick) {
             this.requestDOMUpdate(() => this.execJS(target, phxClick, "click"));
           }
+        };
+
+        if (!this.dispatchBeforeNavigate(detail)) {
+          execPhxClick();
+          return;
+        }
+
+        if (linkState === "push") {
+          this.reserveHistoryEntry(href, type);
+        }
+
+        this.requestDOMUpdate(() => {
+          if (type === "patch") {
+            this.pushHistoryPatch(e, href, linkState, target);
+          } else {
+            this.historyRedirect(e, href, linkState, null, target);
+          }
+          execPhxClick();
         });
       },
       false,
@@ -1480,9 +1722,14 @@ export default class LiveSocket {
   }
 
   /** @internal */
+  dispatchBeforeNavigate(detail) {
+    return DOM.dispatchEvent(window, "phx:before-navigate", { detail });
+  }
+
+  /** @internal */
   pushHistoryPatch(e, href, linkState, targetEl) {
     if (!this.isConnected() || !(this.main && this.main.isMain())) {
-      return Browser.redirect(href);
+      return this.browserRedirect(href);
     }
 
     this.withPageLoading({ to: href, kind: "patch" }, (done) => {
@@ -1499,23 +1746,9 @@ export default class LiveSocket {
       return;
     }
 
-    // Increment position for new state
-    this.currentHistoryPosition++;
-    this.sessionStorage.setItem(
-      PHX_LV_HISTORY_POSITION,
-      this.currentHistoryPosition.toString(),
-    );
-
-    // store the type for back navigation
-    Browser.updateCurrentState((state) => ({ ...state, backType: "patch" }));
-
-    Browser.pushState(
+    this.commitHistoryEntry(
       linkState,
-      {
-        type: "patch",
-        id: this.main!.id,
-        position: this.currentHistoryPosition,
-      },
+      { type: "patch", id: this.main!.id },
       href,
     );
 
@@ -1538,39 +1771,17 @@ export default class LiveSocket {
       targetEl.classList.add("phx-click-loading");
     }
     if (!this.isConnected() || !(this.main && this.main.isMain())) {
-      return Browser.redirect(href, flash);
+      return this.browserRedirect(href, flash);
     }
 
-    // convert to full href if only path prefix
-    if (/^\/$|^\/[^\/]+.*$/.test(href)) {
-      const { protocol, host } = window.location;
-      href = `${protocol}//${host}${href}`;
-    }
+    href = resolveURL(href);
     const scroll = window.scrollY;
     this.withPageLoading({ to: href, kind: "redirect" }, (done) => {
       this.replaceMain(href, flash, (linkRef) => {
         if (linkRef === this.linkRef) {
-          // Increment position for new state
-          this.currentHistoryPosition++;
-          this.sessionStorage.setItem(
-            PHX_LV_HISTORY_POSITION,
-            this.currentHistoryPosition.toString(),
-          );
-
-          // store the type for back navigation
-          Browser.updateCurrentState((state) => ({
-            ...state,
-            backType: "redirect",
-          }));
-
-          Browser.pushState(
+          this.commitHistoryEntry(
             linkState,
-            {
-              type: "redirect",
-              id: this.main!.id,
-              scroll: scroll,
-              position: this.currentHistoryPosition,
-            },
+            { type: "redirect", id: this.main!.id, scroll: scroll },
             href,
           );
 
@@ -1589,13 +1800,107 @@ export default class LiveSocket {
     });
   }
 
+  /**
+   * @internal
+   * Live navigation creates its history entry once the server replies, outside
+   * of the click that started it. Browsers that skip entries added without user
+   * activation on back navigation (such as Safari) may then skip the page the
+   * user navigated from. To avoid this, a live link click creates the entry
+   * immediately and the navigation fills it in when it completes.
+   */
+  reserveHistoryEntry(href: string, type: "patch" | "redirect") {
+    if (
+      !Browser.canPushState() ||
+      href === window.location.href ||
+      // the History API rejects URLs from another origin
+      new URL(href, document.baseURI).origin !== window.location.origin
+    ) {
+      return;
+    }
+    const meta = { type, id: this.main!.id };
+    if (this.historyReservation) {
+      // a superseded navigation already reserved the current entry
+      const { position } = this.historyReservation;
+      history.replaceState({ ...meta, position }, "", href);
+    } else {
+      const referer = this.currentLocation.href;
+      // store the type and scroll position for back navigation
+      Browser.updateCurrentState((state) => ({
+        ...state,
+        backType: type,
+        ...(type === "redirect" ? { scroll: window.scrollY } : {}),
+      }));
+      this.setHistoryPosition(this.currentHistoryPosition + 1);
+      history.pushState(
+        { ...meta, position: this.currentHistoryPosition },
+        "",
+        href,
+      );
+      this.historyReservation = {
+        position: this.currentHistoryPosition,
+        referer,
+      };
+    }
+    this.registerNewLocation(window.location);
+  }
+
+  /** @internal */
+  commitHistoryEntry(
+    linkState: "push" | "replace",
+    meta: { type: "patch" | "redirect"; id: string; scroll?: number },
+    href: string,
+  ) {
+    const reservation = this.historyReservation;
+    this.historyReservation = null;
+    if (reservation) {
+      // the scroll position was stored when the entry was reserved
+      const { scroll: _scroll, ...rest } = meta;
+      Browser.pushState(
+        "replace",
+        { ...rest, position: reservation.position },
+        href,
+        true,
+      );
+      return;
+    }
+
+    // Increment position for new state
+    this.setHistoryPosition(this.currentHistoryPosition + 1);
+
+    // store the type for back navigation
+    Browser.updateCurrentState((state) => ({ ...state, backType: meta.type }));
+
+    Browser.pushState(
+      linkState,
+      { ...meta, position: this.currentHistoryPosition },
+      href,
+    );
+  }
+
+  private setHistoryPosition(position: number) {
+    this.currentHistoryPosition = position;
+    this.sessionStorage.setItem(
+      PHX_LV_HISTORY_POSITION,
+      this.currentHistoryPosition.toString(),
+    );
+  }
+
   /** @internal */
   registerNewLocation(newLocation) {
+    if (!this.isNewLocation(newLocation)) {
+      return false;
+    } else {
+      this.currentLocation = clone(newLocation);
+      return true;
+    }
+  }
+
+  /** @internal */
+  isNewLocation(newLocation) {
     const { pathname, search } = this.currentLocation;
     if (pathname + search === newLocation.pathname + newLocation.search) {
       return false;
     } else {
-      this.currentLocation = clone(newLocation);
       return true;
     }
   }
@@ -1614,7 +1919,7 @@ export default class LiveSocket {
         externalFormSubmitted = true;
         e.preventDefault();
         this.withinOwners(e.target, (view) => {
-          view.disableForm(e.target);
+          view.disableForm(e.target as HTMLFormElement, phxChange);
           // safari needs next tick
           window.requestAnimationFrame(() => {
             if (DOM.isUnloadableFormSubmit(e)) {
@@ -1636,7 +1941,6 @@ export default class LiveSocket {
         return;
       }
       e.preventDefault();
-      e.target.disabled = true;
       this.withinOwners(e.target, (view) => {
         JS.exec(e, "submit", phxEvent, view, e.target, [
           "push",

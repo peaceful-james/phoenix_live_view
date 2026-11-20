@@ -10,20 +10,20 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     env:
-      elixir: 1.18.1
-      otp: 27.2
+      elixir: 1.20.5
+      otp: 29.1.2
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.elixir }}
           otp-version: ${{ env.otp }}
 
       - name: Restore deps and _build cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             deps
@@ -34,13 +34,13 @@ jobs:
       - name: Install Dependencies
         run: mix deps.get --only dev
 
-      - name: Set up Node.js 20.x
-        uses: actions/setup-node@v4
+      - name: Set up Node.js 24.x
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 20.x
+          node-version: 24.x
 
       - name: Restore npm cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.npm
           key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
@@ -55,7 +55,7 @@ jobs:
 
       - name: Push updated assets
         id: push_assets
-        uses: stefanzweifel/git-auto-commit-action@v5
+        uses: stefanzweifel/git-auto-commit-action@b863ae1933cb653a53c021fe36dbb774e1fb9403 # v5.2.0
         with:
           commit_message: Update assets
           file_pattern: priv/static

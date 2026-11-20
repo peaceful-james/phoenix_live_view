@@ -18,9 +18,23 @@ defmodule Phoenix.LiveViewTest.E2E.Navigation.Layout do
       });
       liveSocket.connect();
       window.liveSocket = liveSocket;
+      window.liveNavigationPreventEnabled = false;
+
+      window.addEventListener("phx:before-navigate", (e) => {
+        console.log("before navigate event", JSON.stringify(e.detail));
+        if (window.liveNavigationPreventEnabled) {
+          e.preventDefault();
+        }
+      });
 
       window.addEventListener("phx:navigate", (e) => {
         console.log("navigate event", JSON.stringify(e.detail));
+      });
+
+      window.addEventListener("change", (e) => {
+        if (e.target && e.target.id === "prevent-navigation-toggle") {
+          window.liveNavigationPreventEnabled = e.target.checked;
+        }
       });
     </script>
 
@@ -37,6 +51,11 @@ defmodule Phoenix.LiveViewTest.E2E.Navigation.Layout do
     <div style="display: flex; width: 100%; height: 100vh;">
       <div style="position: fixed; height: 100vh; background-color: #f8fafc; border-right: 1px solid; width: 20rem; display: flex; flex-direction: column; padding: 1rem; gap: 0.5rem;">
         <h1 style="margin-bottom: 1rem; font-size: 1.125rem; line-height: 1.75rem;">Navigation</h1>
+
+        <label style="display: flex; align-items: center; gap: 0.5rem; background-color: #e2e8f0; padding: 0.5rem; cursor: pointer;">
+          <input id="prevent-navigation-toggle" type="checkbox" />
+          <span>Prevent navigation</span>
+        </label>
 
         <.link navigate="/navigation/a" style="background-color: #f1f5f9; padding: 0.5rem;">
           LiveView A
@@ -66,6 +85,8 @@ end
 defmodule Phoenix.LiveViewTest.E2E.Navigation.ALive do
   use Phoenix.LiveView
 
+  alias Phoenix.LiveView.JS
+
   @impl Phoenix.LiveView
   def mount(_params, _session, socket) do
     socket
@@ -84,6 +105,11 @@ defmodule Phoenix.LiveViewTest.E2E.Navigation.ALive do
   end
 
   @impl Phoenix.LiveView
+  def handle_event("server_navigate", _params, socket) do
+    {:noreply, push_navigate(socket, to: "/navigation/b")}
+  end
+
+  @impl Phoenix.LiveView
   def render(assigns) do
     ~H"""
     <h1>This is page A</h1>
@@ -93,6 +119,21 @@ defmodule Phoenix.LiveViewTest.E2E.Navigation.ALive do
     <.styled_link patch={"/navigation/a?param=#{@param_next}"}>Patch this LiveView</.styled_link>
     <.styled_link patch={"/navigation/a?param=#{@param_next}"} replace>Patch (Replace)</.styled_link>
     <.styled_link navigate="/navigation/b#items-item-42">Navigate to 42</.styled_link>
+    <.styled_link navigate="/navigation/slow?sleep=1000">Slow</.styled_link>
+    <.styled_link navigate="/navigation/slow?redirect=live">Slow (live redirect)</.styled_link>
+    <.styled_link navigate="/navigation/slow?redirect=http">Slow (redirect)</.styled_link>
+    <.styled_link patch="/navigation/a#fragment">Patch to fragment</.styled_link>
+    <.styled_link navigate="/navigation/a#fragment">Navigate to fragment</.styled_link>
+    <.styled_link navigate="http://127.0.0.1:4004/navigation/dead">Other origin</.styled_link>
+    <button
+      type="button"
+      phx-click="server_navigate"
+      style="padding-left: 1rem; padding-right: 1rem; padding-top: 0.5rem; padding-bottom: 0.5rem; background-color: #e2e8f0; display: inline-flex; align-items: center; border-radius: 0.375rem; cursor: pointer;"
+    >
+      Server Navigate
+    </button>
+    <button type="button" phx-click={JS.patch("?param=#{@param_next}")}>JS patch (relative)</button>
+    <button type="button" phx-click={JS.navigate("b")}>JS navigate (relative)</button>
     """
   end
 
@@ -172,6 +213,28 @@ defmodule Phoenix.LiveViewTest.E2E.Navigation.BLive do
     <div :if={@live_action == :show}>
       <p>Item {@id}</p>
     </div>
+    """
+  end
+end
+
+defmodule Phoenix.LiveViewTest.E2E.Navigation.SlowLive do
+  use Phoenix.LiveView
+
+  @impl Phoenix.LiveView
+  def mount(params, _session, socket) do
+    if connected?(socket), do: Process.sleep(String.to_integer(params["sleep"] || "0"))
+
+    case {connected?(socket), params["redirect"]} do
+      {true, "live"} -> {:ok, push_navigate(socket, to: "/navigation/b")}
+      {true, "http"} -> {:ok, redirect(socket, to: "/navigation/dead")}
+      _ -> {:ok, socket}
+    end
+  end
+
+  @impl Phoenix.LiveView
+  def render(assigns) do
+    ~H"""
+    <h1>This is the slow page</h1>
     """
   end
 end

@@ -4,15 +4,16 @@ import {
   PHX_PREFLIGHTED_REFS,
 } from "./constants";
 
-import { channelUploader, logError } from "./utils";
+import { channelUploader } from "./utils";
 
 import LiveUploader from "./live_uploader";
 
 export default class UploadEntry {
   static isActive(fileEl, file) {
-    const isNew = file._phxRef === undefined;
+    const ref = file._phxRef;
+    const isNew = ref === undefined;
     const activeRefs = fileEl.getAttribute(PHX_ACTIVE_ENTRY_REFS).split(",");
-    const isActive = activeRefs.indexOf(LiveUploader.genFileRef(file)) >= 0;
+    const isActive = !isNew && activeRefs.indexOf(ref) >= 0;
     return file.size > 0 && (isNew || isActive);
   }
 
@@ -41,8 +42,10 @@ export default class UploadEntry {
     this.meta = null;
     this._isCancelled = false;
     this._isDone = false;
+    this._isErrored = false;
     this._progress = 0;
     this._lastProgressSent = -1;
+    this._onCancel = function () {};
     this._onDone = function () {};
     this._onElUpdated = this.onElUpdated.bind(this);
     this.fileEl.addEventListener(PHX_LIVE_FILE_UPDATED, this._onElUpdated);
@@ -79,7 +82,11 @@ export default class UploadEntry {
     this.file._preflightInProgress = false;
     this._isCancelled = true;
     this._isDone = true;
-    this._onDone();
+    try {
+      this._onCancel();
+    } finally {
+      this._onDone();
+    }
   }
 
   isDone() {
@@ -87,21 +94,52 @@ export default class UploadEntry {
   }
 
   error(reason = "failed") {
-    this.fileEl.removeEventListener(PHX_LIVE_FILE_UPDATED, this._onElUpdated);
-    this.view.pushFileProgress(this.fileEl, this.ref, { error: reason });
-    if (!this.isAutoUpload()) {
-      LiveUploader.clearFiles(this.fileEl);
-    }
+    this.fail(reason, true);
+  }
+
+  isErrored() {
+    return this._isErrored;
   }
 
   isAutoUpload() {
     return this.autoUpload;
   }
 
+  onCancel(callback) {
+    if (this.isCancelled()) {
+      callback();
+    } else {
+      this._onCancel = callback;
+    }
+  }
+
   //private
+
+  // notifyServer is false when the server already recorded the failure,
+  // for example for upload writer errors
+  fail(reason, notifyServer) {
+    if (this._isErrored) {
+      return;
+    }
+    this._isErrored = true;
+    this._isDone = true;
+    this.fileEl.removeEventListener(PHX_LIVE_FILE_UPDATED, this._onElUpdated);
+    try {
+      if (notifyServer) {
+        this.view.pushFileProgress(this.fileEl, this.ref, { error: reason });
+      }
+      if (!this.isAutoUpload()) {
+        LiveUploader.clearFiles(this.fileEl);
+      }
+    } finally {
+      this._onDone();
+    }
+  }
 
   onDone(callback) {
     this._onDone = () => {
+      // A late progress reply or cancellation must not complete an entry twice.
+      this._onDone = function () {};
       this.fileEl.removeEventListener(PHX_LIVE_FILE_UPDATED, this._onElUpdated);
       callback();
     };
@@ -133,7 +171,11 @@ export default class UploadEntry {
     if (this.meta.uploader) {
       const callback =
         uploaders[this.meta.uploader] ||
-        logError(`no uploader configured for ${this.meta.uploader}`);
+        this.view.logError(
+          "upload.missing-uploader",
+          `no uploader configured for ${this.meta.uploader}`,
+          { uploader: this.meta.uploader, uploaders },
+        );
       return { name: this.meta.uploader, callback: callback };
     } else {
       return { name: "channel", callback: channelUploader };
@@ -143,10 +185,16 @@ export default class UploadEntry {
   zipPostFlight(resp) {
     this.meta = resp.entries[this.ref];
     if (!this.meta) {
-      logError(`no preflight upload response returned with ref ${this.ref}`, {
-        input: this.fileEl,
-        response: resp,
-      });
+      this.view.logError(
+        "upload.missing-preflight-response",
+        `no preflight upload response returned with ref ${this.ref}`,
+        {
+          ref: this.ref,
+          input: this.fileEl,
+          response: resp,
+        },
+        { attribution: "internal" },
+      );
     }
   }
 }

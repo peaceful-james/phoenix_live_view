@@ -178,38 +178,56 @@ const JS = {
   },
 
   exec_focus(e, eventType, phxEvent, view, sourceEl, el) {
-    ARIA.attemptFocus(el);
-    // in case the JS.focus command is in a JS.show/hide/toggle chain, for show we need
-    // to wait for JS.show to have updated the element's display property (see exec_toggle)
-    // but that run in nested animation frames, therefore we need to use them here as well
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => ARIA.attemptFocus(el));
-    });
+    this.focusWithRetry(() => ARIA.attemptFocus(el));
   },
 
   exec_focus_first(e, eventType, phxEvent, view, sourceEl, el) {
-    ARIA.focusFirstInteractive(el) || ARIA.focusFirst(el);
-    // if you wonder about the nested animation frames, see exec_focus
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(
-        () => ARIA.focusFirstInteractive(el) || ARIA.focusFirst(el),
-      );
-    });
+    this.focusWithRetry(
+      () => ARIA.focusFirstInteractive(el) || ARIA.focusFirst(el),
+    );
   },
 
   exec_push_focus(e, eventType, phxEvent, view, sourceEl, el) {
-    focusStack.push(el || sourceEl);
+    if (view.isDestroyed()) {
+      return;
+    }
+    focusStack.push({ el: el || sourceEl, view });
   },
 
-  exec_pop_focus(_e, _eventType, _phxEvent, _view, _sourceEl, _el) {
-    const el = focusStack.pop();
-    if (el) {
-      el.focus();
-      // if you wonder about the nested animation frames, see exec_focus
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => el.focus());
-      });
+  exec_pop_focus(_e, _eventType, _phxEvent, view, _sourceEl, _el) {
+    if (view.isDestroyed()) {
+      return;
     }
+    const focusEntry = focusStack.pop();
+    if (focusEntry) {
+      const { el } = focusEntry;
+      this.focusWithRetry(() => el.focus());
+    }
+  },
+
+  focusWithRetry(callback) {
+    callback();
+    const activeElement = document.activeElement;
+    // JS.show/hide/toggle may update display in nested animation frames (see exec_toggle).
+    // Retry after those updates, unless focus has moved since the initial attempt.
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (document.activeElement === activeElement) {
+          callback();
+        }
+      });
+    });
+  },
+
+  dropFocus(view) {
+    let dropped = 0;
+    for (let i = focusStack.length - 1; i >= 0; i--) {
+      if (focusStack[i].view === view) {
+        focusStack.splice(i, 1);
+        dropped++;
+      }
+    }
+    return dropped;
   },
 
   exec_add_class(
@@ -391,7 +409,7 @@ const JS = {
   },
 
   toggle(eventType, view, el, display, ins, outs, time, blocking) {
-    time = time || default_transition_time;
+    time = time == null ? default_transition_time : time;
     const [inClasses, inStartClasses, inEndClasses] = ins || [[], [], []];
     const [outClasses, outStartClasses, outEndClasses] = outs || [[], [], []];
     if (inClasses.length > 0 || outClasses.length > 0) {
@@ -532,7 +550,7 @@ const JS = {
   },
 
   addOrRemoveClasses(el, adds, removes, transition, time, view, blocking) {
-    time = time || default_transition_time;
+    time = time == null ? default_transition_time : time;
     const [transitionRun, transitionStart, transitionEnd] = transition || [
       [],
       [],

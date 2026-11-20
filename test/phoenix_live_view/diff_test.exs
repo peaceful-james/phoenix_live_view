@@ -427,6 +427,61 @@ defmodule Phoenix.LiveView.DiffTest do
     end
   end
 
+  defmodule NestedLeafComponent do
+    use Phoenix.LiveComponent
+
+    def render(assigns) do
+      ~H"""
+      <div id={@id}>LEAF</div>
+      """
+    end
+  end
+
+  defmodule NestedRootComponent do
+    use Phoenix.LiveComponent
+
+    defmodule Branch do
+      use Phoenix.LiveComponent
+
+      def render(assigns) do
+        ~H"""
+        <div>
+          <.live_component module={NestedLeafComponent} id="leaf" />
+        </div>
+        """
+      end
+    end
+
+    def render(assigns) do
+      ~H"""
+      <div>
+        TICK {@tick}
+        <%= if @show_child do %>
+          <.live_component module={Branch} id="branch" />
+        <% end %>
+      </div>
+      """
+    end
+  end
+
+  defmodule KeyedRootComponent do
+    use Phoenix.LiveComponent
+
+    def render(assigns) do
+      ~H"""
+      <div>
+        TICK {@tick}
+        <.live_component
+          :for={id <- @child_ids}
+          :key={id}
+          module={NestedLeafComponent}
+          id={id}
+        />
+      </div>
+      """
+    end
+  end
+
   defmodule TempComponent do
     use Phoenix.LiveComponent
 
@@ -515,6 +570,27 @@ defmodule Phoenix.LiveView.DiffTest do
       <.live_component :let={%{value: value}} module={SlotComponent} id="WORLD">
         WITH VALUE {value}
       </.live_component>
+      """
+    end
+  end
+
+  defmodule GlobalAttrsComponent do
+    use Phoenix.Component
+
+    attr :size, :integer, default: 24
+    attr :rest, :global
+
+    def icon(assigns) do
+      ~H"""
+      <svg width={@size} {@rest}></svg>
+      """
+    end
+
+    attr :rest, :global, default: %{class: "default"}
+
+    def icon_with_default(assigns) do
+      ~H"""
+      <svg class={@rest[:class]}></svg>
       """
     end
   end
@@ -1046,7 +1122,185 @@ defmodule Phoenix.LiveView.DiffTest do
     end
   end
 
+  describe "global attributes" do
+    defp global_attrs_list(assigns) do
+      ~H"""
+      <GlobalAttrsComponent.icon
+        :for={item <- @items}
+        :key={item.id}
+        size={@size}
+        class={item.class}
+      />
+      """
+    end
+
+    defp global_attrs_if(assigns) do
+      ~H"""
+      <GlobalAttrsComponent.icon :if={@show} size={@size} class="icon" />
+      """
+    end
+
+    defp global_attrs_default(assigns) do
+      ~H"""
+      <GlobalAttrsComponent.icon_with_default class={@class} />
+      """
+    end
+
+    test "are only sent when they change" do
+      items = [%{id: 1, class: "a"}, %{id: 2, class: "b"}]
+      assigns = %{socket: %Socket{}, items: items, size: 24}
+      {_, fingerprints, components} = render(global_attrs_list(assigns))
+
+      assigns = %{socket: %Socket{}, items: items, size: 20, __changed__: %{size: true}}
+
+      {full_render, fingerprints, components} =
+        render(global_attrs_list(assigns), fingerprints, components)
+
+      assert full_render == %{
+               0 => %{
+                 k: %{
+                   0 => %{0 => %{0 => ~s( width="20")}},
+                   1 => %{0 => %{0 => ~s( width="20")}},
+                   :kc => 2
+                 }
+               }
+             }
+
+      items = [%{id: 1, class: "a"}, %{id: 2, class: "c"}]
+      assigns = %{socket: %Socket{}, items: items, size: 20, __changed__: %{items: true}}
+      {full_render, _, _} = render(global_attrs_list(assigns), fingerprints, components)
+
+      assert full_render == %{0 => %{k: %{1 => %{0 => %{1 => ~s( class="c")}}, :kc => 2}}}
+    end
+
+    test "are sent in full when the component is first rendered" do
+      assigns = %{socket: %Socket{}, show: false, size: 24}
+      {_, fingerprints, components} = render(global_attrs_if(assigns))
+
+      assigns = %{socket: %Socket{}, show: true, size: 24, __changed__: %{show: true}}
+      {full_render, _, _} = render(global_attrs_if(assigns), fingerprints, components)
+
+      assert full_render == %{
+               0 => %{
+                 0 => %{0 => ~s( width="24"), 1 => ~s( class="icon"), :s => 0, :r => 1},
+                 :s => 1
+               },
+               :p => %{0 => ["<svg", "", "></svg>"], 1 => ["", ""]}
+             }
+    end
+
+    test "are sent when they change to the default value" do
+      assigns = %{socket: %Socket{}, class: "a"}
+      {_, fingerprints, components} = render(global_attrs_default(assigns))
+
+      assigns = %{socket: %Socket{}, class: "default", __changed__: %{class: true}}
+      {full_render, _, _} = render(global_attrs_default(assigns), fingerprints, components)
+
+      assert full_render == %{0 => %{0 => "default"}}
+    end
+  end
+
   describe "live components" do
+    test "revives a subtree that change tracking skipped" do
+      root = %Component{
+        id: "root",
+        assigns: %{tick: 0, show_child: true},
+        component: NestedRootComponent
+      }
+
+      {_, fingerprints, components} = render(component_template(%{component: root}))
+
+      root = %{root | assigns: %{tick: 1, show_child: true}}
+
+      {_, fingerprints, components} =
+        render(component_template(%{component: root}), fingerprints, components)
+
+      # The branch dynamic was skipped, so the root render never reached it.
+
+      # The client removes the component subtree and reports both CIDs.
+      {_, fingerprints, components} =
+        render(component_template(%{component: ""}), fingerprints, components)
+
+      components = Diff.mark_for_deletion_component(1, components)
+      components = Diff.mark_for_deletion_component(2, components)
+      components = Diff.mark_for_deletion_component(3, components)
+
+      # The same component identity is rendered before cids_destroyed arrives.
+      {_, _fingerprints, components} =
+        render(component_template(%{component: root}), fingerprints, components)
+
+      assert {[], components} = Diff.delete_component(1, components)
+      assert {[], components} = Diff.delete_component(2, components)
+      assert {[], _components} = Diff.delete_component(3, components)
+    end
+
+    test "does not revive children that are no longer rendered" do
+      root = %Component{
+        id: "root",
+        assigns: %{tick: 0, show_child: true},
+        component: NestedRootComponent
+      }
+
+      {_, fingerprints, components} = render(component_template(%{component: root}))
+
+      root = %{root | assigns: %{tick: 1, show_child: false}}
+
+      {_, fingerprints, components} =
+        render(component_template(%{component: root}), fingerprints, components)
+
+      # The removed branch is awaiting cids_destroyed when the parent is also removed.
+      components = Diff.mark_for_deletion_component(2, components)
+      components = Diff.mark_for_deletion_component(3, components)
+
+      {_, fingerprints, components} =
+        render(component_template(%{component: ""}), fingerprints, components)
+
+      components = Diff.mark_for_deletion_component(1, components)
+
+      # Reviving the parent must not revive the leaf that is no longer in its subtree.
+      {_, _fingerprints, components} =
+        render(component_template(%{component: root}), fingerprints, components)
+
+      assert {[], components} = Diff.delete_component(1, components)
+      assert {[2], components} = Diff.delete_component(2, components)
+      assert {[3], _components} = Diff.delete_component(3, components)
+    end
+
+    test "revives keyed comprehension children" do
+      root = %Component{
+        id: "root",
+        assigns: %{tick: 0, child_ids: ["a", "b"]},
+        component: KeyedRootComponent
+      }
+
+      {_, fingerprints, components} = render(component_template(%{component: root}))
+
+      root = %{root | assigns: %{tick: 1, child_ids: ["b", "a"]}}
+
+      {_, fingerprints, components} =
+        render(component_template(%{component: root}), fingerprints, components)
+
+      root = %{root | assigns: %{tick: 2, child_ids: ["b"]}}
+
+      {_, fingerprints, components} =
+        render(component_template(%{component: root}), fingerprints, components)
+
+      components = Diff.mark_for_deletion_component(2, components)
+
+      {_, fingerprints, components} =
+        render(component_template(%{component: ""}), fingerprints, components)
+
+      components = Diff.mark_for_deletion_component(1, components)
+      components = Diff.mark_for_deletion_component(3, components)
+
+      {_, _fingerprints, components} =
+        render(component_template(%{component: root}), fingerprints, components)
+
+      assert {[], components} = Diff.delete_component(1, components)
+      assert {[2], components} = Diff.delete_component(2, components)
+      assert {[], _components} = Diff.delete_component(3, components)
+    end
+
     test "on mount" do
       component = %Component{id: "hello", assigns: %{from: :component}, component: MyComponent}
       rendered = component_template(%{component: component})

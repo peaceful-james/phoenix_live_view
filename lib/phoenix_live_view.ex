@@ -226,7 +226,7 @@ defmodule Phoenix.LiveView do
 
   '''
 
-  alias Phoenix.LiveView.{Socket, LiveStream, Async}
+  alias Phoenix.LiveView.{Socket, LiveStream, Async, Route}
 
   @type unsigned_params :: map
 
@@ -883,8 +883,14 @@ defmodule Phoenix.LiveView do
       `:any` instead of a list to support to allow any kind of file.
       For example, `[".jpeg"]`, `:any`, etc.
 
-    * `:max_entries` - The maximum number of selected files to allow per
-      file input. Defaults to 1.
+    * `:max_entries` - The maximum number of files to allow. Defaults to 1.
+
+    * `:max_entries_mode` - Controls how `:max_entries` is counted. `:selected`
+      limits the entries currently selected by the file input, so consuming an
+      entry frees capacity for another. `:total` also counts entries that have
+      already been consumed for the lifetime of the upload configuration. Once
+      all entries have been consumed or cancelled, call `allow_upload/3` again
+      to reset a `:total` limit. Defaults to `:selected`.
 
     * `:max_file_size` - The maximum file size in bytes to allow to be uploaded.
       Defaults 8MB. For example, `12_000_000`.
@@ -897,8 +903,11 @@ defmodule Phoenix.LiveView do
 
     * `:external` - A 2-arity function for generating metadata for external
       client uploaders. This function must return either `{:ok, meta, socket}`
-      or `{:error, meta, socket}` where meta is a map. See the Uploads section
-      for example usage.
+      or `{:error, error_meta, socket}`, where `meta` and `error_meta` are maps.
+      An error marks the entry as failed and exposes
+      `{:external_metadata_failure, error_meta}` via `Phoenix.Component.upload_errors/2`.
+      With auto uploads, any remaining valid entries continue uploading. See the
+      Uploads section for example usage.
 
     * `:progress` - An optional 3-arity function for receiving progress events.
 
@@ -1061,6 +1070,38 @@ defmodule Phoenix.LiveView do
   defdelegate consume_uploaded_entry(socket, entry, func), to: Phoenix.LiveView.Upload
 
   @doc """
+  Returns the navigation type for the given local path.
+
+  The navigation type is:
+
+    * `:patch` when the path points to the current LiveView in the current
+      `live_session`
+    * `:navigate` when the path points to another LiveView in the current
+      `live_session`
+    * `:href` otherwise
+
+  During disconnected render this function always returns `:href`. Once
+  the LiveView connects, a full render resolves the live navigation type.
+
+  This function is useful for components which link to paths that may or may
+  not support live navigation:
+
+  ```heex
+  <.link {%{navigation_type(@socket, @to) => @to}}>
+    Open
+  </.link>
+  ```
+
+  Choosing `:patch` for the current LiveView avoids remounting it. Use an
+  explicit `navigate` attribute instead if the LiveView should be remounted.
+  """
+  @spec navigation_type(Socket.t(), String.t()) :: :patch | :navigate | :href
+  def navigation_type(%Socket{} = socket, path) when is_binary(path) do
+    path = validate_local_url!(path, "navigation_type/2")
+    Route.navigation_type(socket, path)
+  end
+
+  @doc """
   Annotates the socket for redirect to a destination path.
 
   *Note*: LiveView redirects rely on instructing client
@@ -1206,7 +1247,8 @@ defmodule Phoenix.LiveView do
     raise ArgumentError, "socket already prepared to redirect with #{inspect(to)}"
   end
 
-  @invalid_local_url_chars ["\\"]
+  # We add \r and \n since those are checked on Phoenix at the header level
+  @invalid_local_url_chars ["\\", "/%09", "/\t", "\n", "\r"]
 
   defp validate_local_url!("//" <> _ = to, where) do
     raise_invalid_local_url!(to, where)
@@ -1979,6 +2021,12 @@ defmodule Phoenix.LiveView do
        For example, when you render a non-stream item at the beginning of the stream container and then
        prepend items (with `at: 0`) to the stream, the non-stream item will be pushed down.
 
+  Also note that after patching the DOM, LiveView always orders stream items before non-stream items.
+  This means that in the `songs-empty` example above, the empty placeholder would be placed after stream
+  items in case the table is not empty. If you need to customize this, you can manually reorder elements
+  with a [JavaScript hook](js-interop.md#client-hooks-via-phx-hook).
+  See [this issue](https://github.com/phoenixframework/phoenix_live_view/issues/3744#issuecomment-2781485595) for an example.
+
   """
   @spec stream(
           socket :: Socket.t(),
@@ -2458,4 +2506,167 @@ defmodule Phoenix.LiveView do
   def cancel_async(socket, async_or_keys, reason \\ {:shutdown, :cancel}) do
     Async.cancel_async(socket, async_or_keys, reason)
   end
+
+  @doc """
+  Subscribes to `Phoenix.PubSub` messages on the given topic.
+
+  This works with both LiveViews and LiveComponents. LiveView tracks each
+  subscription and subscribes to the given pubsub only once within a single
+  LiveView process (including all of its LiveComponents). It automatically
+  unsubscribes from PubSub once all subscriptions or - in case of components -
+  the last subscribed component is removed from the page.
+
+  Calling `subscribe` again with the same callback is a no-op, so it does not lead
+  to duplicate callback invocations. A LiveView or LiveComponent can only have one
+  callback per topic: subscribing to the same topic with a different callback raises.
+  Call `unsubscribe/2` first if you want to replace it.
+
+  `callback` is invoked with the broadcast message and the socket, mirroring
+  `c:handle_info/2`, and must return the updated socket. For components, it
+  receives the component's own socket. Messages delivered to the callback do not
+  go through `c:handle_info/2`, so `:handle_info` hooks attached with `attach_hook/4`
+  do not see them.
+
+  If the LiveView and some of its components subscribe to the same topic, each of
+  their callbacks is invoked for every message. The order in which they are invoked
+  is not guaranteed.
+
+  On the initial disconnected render there is no process to deliver messages to,
+  so this is a no-op. It must be called from the LiveView process itself and
+  raises otherwise, for example when called from a task started by `assign_async/4`.
+
+  By default, the endpoint's configured `:pubsub_server` is used:
+
+      socket.endpoint.config(:pubsub_server)
+
+  If the endpoint has no `:pubsub_server` configured, this raises an `ArgumentError`.
+  If you need to pass a different one, use `subscribe/4`.
+
+  > #### Captured variables {: .warning}
+  >
+  > The callback is kept for as long as the subscription is active. If it is an
+  > anonymous function, every variable it references from the surrounding scope
+  > is kept alive with it. In particular, do not reference the `socket` from
+  > `mount/3` inside the callback: it keeps the assigns from subscription time in
+  > memory, and reading them gives you stale data. To avoid running into such pitfalls,
+  > prefer using function captures:
+  >
+  >     # bad: socket.assigns.items is the value from mount
+  >     subscribe(socket, MyApp.PubSub, "topic", fn message, new_socket ->
+  >       assign(new_socket, :items, [message | socket.assigns.items])
+  >     end)
+  >
+  >     # good
+  >     subscribe(socket, MyApp.PubSub, "topic", &handle_message/2)
+
+  > #### Code reloading {: .info}
+  >
+  > Anonymous functions and local captures such as `&handle_message/2` point to the
+  > version of the module that was loaded when `subscribe` was called. If the module
+  > is recompiled while the LiveView keeps running, for example when LiveView
+  > re-renders in place after a code change in development, the callback keeps
+  > running the old code. Once the module is recompiled a second time, invoking the
+  > callback raises, and the LiveView crashes and remounts. Remote captures of public
+  > functions, such as `&__MODULE__.handle_message/2`, always call the latest version
+  > of the module.
+
+  ## Examples
+
+      def mount(%{"id" => id}, _session, socket) do
+        subscribe(socket, "room:\#{id}", &handle_room_update/2)
+
+        {:ok, socket}
+      end
+
+      defp handle_room_update({:updated, room}, socket) do
+        stream_insert(socket, :rooms, room)
+      end
+
+  """
+  @spec subscribe(
+          socket :: Socket.t(),
+          topic :: binary(),
+          callback :: (message :: term(), socket :: Socket.t() -> Socket.t())
+        ) :: :ok
+  def subscribe(socket, topic, callback)
+      when is_struct(socket, Socket) and is_binary(topic) and is_function(callback, 2) do
+    subscribe(socket, endpoint_pubsub_server!(socket), topic, callback)
+  end
+
+  @doc """
+  Subscribes to `Phoenix.PubSub` messages using the given pubsub server.
+
+  See `subscribe/3`.
+  """
+  @spec subscribe(
+          socket :: Socket.t(),
+          pubsub :: module(),
+          topic :: binary(),
+          callback :: (message :: term(), socket :: Socket.t() -> Socket.t())
+        ) :: :ok
+  defdelegate subscribe(socket, pubsub, topic, callback), to: Phoenix.LiveView.PubSub
+
+  @doc """
+  Unsubscribes from `Phoenix.PubSub` messages on the given topic.
+
+  Only the subscription of the calling LiveView or LiveComponent is removed. Like
+  `subscribe/3`, this uses the endpoint's configured `:pubsub_server` and raises an
+  `ArgumentError` if there is none. If you need to pass a different one, use
+  `unsubscribe/3`.
+
+  ## Examples
+
+      def handle_event("toggle-live-updates", %{"enabled" => enabled}, socket) do
+        topic = "room:\#{socket.assigns.room_id}"
+
+        if enabled == "true" do
+          subscribe(socket, topic, &handle_room_update/2)
+        else
+          unsubscribe(socket, topic)
+        end
+
+        {:noreply, socket}
+      end
+
+  """
+  @spec unsubscribe(
+          socket :: Socket.t(),
+          topic :: binary()
+        ) :: :ok
+  def unsubscribe(socket, topic) when is_struct(socket, Socket) and is_binary(topic) do
+    unsubscribe(socket, endpoint_pubsub_server!(socket), topic)
+  end
+
+  defp endpoint_pubsub_server!(%Socket{endpoint: nil}) do
+    raise ArgumentError, """
+    cannot look up the :pubsub_server because the socket has no endpoint.
+
+    This usually happens when rendering a component with render_component/3
+    in a test module that does not set @endpoint. Either set @endpoint or pass
+    the pubsub server explicitly to Phoenix.LiveView.subscribe/4 and
+    Phoenix.LiveView.unsubscribe/3.
+    """
+  end
+
+  defp endpoint_pubsub_server!(%Socket{endpoint: endpoint}) do
+    endpoint.config(:pubsub_server) ||
+      raise ArgumentError, """
+      no :pubsub_server configured for #{inspect(endpoint)}.
+
+      Either configure a :pubsub_server for your endpoint or pass the pubsub
+      server explicitly to Phoenix.LiveView.subscribe/4 and Phoenix.LiveView.unsubscribe/3.
+      """
+  end
+
+  @doc """
+  Unsubscribes from `Phoenix.PubSub` messages using the given pubsub server.
+
+  See `unsubscribe/2`.
+  """
+  @spec unsubscribe(
+          socket :: Socket.t(),
+          pubsub :: module(),
+          topic :: binary()
+        ) :: :ok
+  defdelegate unsubscribe(socket, pubsub, topic), to: Phoenix.LiveView.PubSub
 end

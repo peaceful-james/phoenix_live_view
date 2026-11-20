@@ -34,9 +34,10 @@ const Browser = {
     kind: "replace" | "push",
     meta: { type: string; scroll?: number; id?: string; position?: number },
     to?: string,
+    force = false,
   ) {
     if (this.canPushState()) {
-      if (to !== window.location.href) {
+      if (force || to !== window.location.href) {
         if (meta.type == "redirect" && meta.scroll) {
           // If we're redirecting store the current scrollY for the current history state.
           const currentState = history.state || {};
@@ -70,13 +71,6 @@ const Browser = {
     const expires =
       typeof maxAgeSeconds === "number" ? ` max-age=${maxAgeSeconds};` : "";
     document.cookie = `${name}=${value};${expires} path=/`;
-  },
-
-  getCookie(name: string) {
-    return document.cookie.replace(
-      new RegExp(`(?:(?:^|.*;\s*)${name}\s*\=\s*([^;]*).*$)|^.*$`),
-      "$1",
-    );
   },
 
   deleteCookie(name: string) {

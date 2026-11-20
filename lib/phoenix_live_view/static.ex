@@ -159,7 +159,7 @@ defmodule Phoenix.LiveView.Static do
           phx_static: sign_static_token(socket)
         ]
 
-        data_attrs = if(router, do: [phx_main: true], else: []) ++ data_attrs
+        data_attrs = if router, do: [phx_main: true] ++ data_attrs, else: data_attrs
 
         attrs = [
           {:id, socket.id},
@@ -347,7 +347,7 @@ defmodule Phoenix.LiveView.Static do
 
       is_nil(socket.router) ->
         # Let the callback fail for the usual reasons
-        Route.live_link_info!(socket, view, uri)
+        Route.invalid_handle_params!(view)
 
       true ->
         Utils.call_handle_params!(socket, view, lifecycle.exported?, params, uri)
@@ -367,6 +367,7 @@ defmodule Phoenix.LiveView.Static do
       view: view,
       root_view: view,
       router: router,
+      route_required?: not is_nil(router),
       live_session_name: live_session_name,
       parent_pid: nil,
       root_pid: nil,
@@ -381,6 +382,7 @@ defmodule Phoenix.LiveView.Static do
       view: view,
       root_view: if(sticky?, do: view, else: parent.private.root_view),
       router: parent.router,
+      route_required?: false,
       parent_pid: if(sticky?, do: nil, else: self()),
       root_pid: if(sticky?, do: nil, else: parent.root_pid),
       session: session
@@ -402,8 +404,8 @@ defmodule Phoenix.LiveView.Static do
   @doc """
   Signs a LiveView token.
   """
-  def sign_token(endpoint, data) do
-    Phoenix.Token.sign(endpoint, Utils.salt!(endpoint), {@token_vsn, data})
+  def sign_token(endpoint, data, opts \\ []) do
+    Phoenix.Token.sign(endpoint, Utils.salt!(endpoint), {@token_vsn, data}, opts)
   end
 
   defp container(%{container: {tag, attrs}}, opts) do
